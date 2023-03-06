@@ -1,65 +1,59 @@
-use std::collections::HashMap;
+use models::{PlayerId, lobby_message::CurrentPlayers};
+use std::{collections::HashMap, time::Duration};
 
-use tokio::{net::TcpStream, sync::mpsc, io::{BufReader, AsyncBufReadExt, AsyncWriteExt}};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::TcpStream,
+    sync::{mpsc, oneshot},
+};
 
-#[derive(std::cmp::Eq, std::cmp::PartialEq, std::hash::Hash, Clone, Copy, Debug)]
-struct PlayerId(u32);
-impl PlayerId{
-    pub fn add(&mut self){
-        self.0 += 1;
-    }
-}
+use models::*;
 
-type WaitingPlayers = HashMap<PlayerId, PlayerInfo>;
 
-#[derive(Clone)]
-struct PlayerInfo {
-    username: String,
-}
-
-enum AddToLobby{
+enum AddToLobby {
     AddNewPlayer(TcpHandle),
 }
 
+#[derive(Debug)]
 enum LobbyCommand {
     RegisterNewPlayer(PlayerId, PlayerInfo),
-    RemovePlayer(PlayerId),
+    RemovePlayer(PlayerId, mpsc::Sender<TcpHandle>),
 }
 
 #[derive(Debug)]
 enum LobyPlayerAction {
     ChooseOpponent(PlayerId, PlayerId),
-    WasChosen(PlayerId, TcpStream),
+    WasChosen(PlayerId, TcpHandle),
 }
 
-pub struct LobbyHandle{
+pub struct LobbyHandle {
     send_to_lobby: mpsc::Sender<AddToLobby>,
 }
 
-enum TcpSend{
+enum TcpSend {
     Read(String),
     Disconnected,
 }
 
-enum TcpRequest{
+enum TcpRequest {
     Write(String),
 }
 
-struct TcpConnection{
+struct TcpConnection {
     send_to_handle: mpsc::Sender<Option<String>>,
     read_from_hande: mpsc::Receiver<TcpRequest>,
 }
 
-async fn run_connection(mut stream: TcpStream, mut con: TcpConnection){
+async fn run_connection(mut stream: TcpStream, mut con: TcpConnection) {
     let (reader, mut writter) = stream.split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
 
-    loop{
+    loop {
         tokio::select! {
             result = reader.read_line(&mut line) => {
                 if result.is_err() {
-                    println!("{}", line);
+                    println!("hi {}", line);
                     line.clear();
                     continue;
                 }
@@ -82,29 +76,30 @@ async fn run_connection(mut stream: TcpStream, mut con: TcpConnection){
     }
 }
 
-pub struct TcpHandle{
+#[derive(Debug)]
+pub struct TcpHandle {
     send_to_stream: mpsc::Sender<TcpRequest>,
     read_from_stream: mpsc::Receiver<Option<String>>,
 }
 
-impl TcpHandle{
+impl TcpHandle {
     pub fn new(stream: TcpStream) -> Self {
         let (tx1, rx1) = mpsc::channel(32);
         let (tx2, rx2) = mpsc::channel(32);
-        let con = TcpConnection{
+        let con = TcpConnection {
             send_to_handle: tx2,
             read_from_hande: rx1,
         };
 
         tokio::spawn(run_connection(stream, con));
-        
-        Self{
+
+        Self {
             send_to_stream: tx1,
             read_from_stream: rx2,
         }
     }
 
-    pub async fn read(&mut self) -> Option<String>{
+    pub async fn read(&mut self) -> Option<String> {
         loop {
             if let Some(res) = self.read_from_stream.recv().await {
                 return res;
@@ -112,30 +107,31 @@ impl TcpHandle{
         }
     }
 
-    pub async fn write(&mut self, text: String){
+    pub async fn write(&mut self, text: String) {
         let _ = self.send_to_stream.send(TcpRequest::Write(text)).await;
     }
 }
 
-impl LobbyHandle{
-    pub fn new() -> Self{
+impl LobbyHandle {
+    pub fn new(game_organizer_sender: mpsc::Sender<[(PlayerId, TcpHandle); 2]>) -> Self {
         let (tx, rx) = mpsc::channel(32);
 
-        let lobby = Lobby::new(rx);
+        let lobby = Lobby::new(rx, game_organizer_sender);
         tokio::spawn(run_lobby(lobby));
 
-        Self{
-            send_to_lobby: tx,
-        }
+        Self { send_to_lobby: tx }
     }
 
-    pub async fn add_player(&mut self, stream: TcpHandle){
-        self.send_to_lobby.send(AddToLobby::AddNewPlayer(stream)).await;
+    pub async fn add_player(&mut self, stream: TcpHandle) {
+        let _ = self
+            .send_to_lobby
+            .send(AddToLobby::AddNewPlayer(stream))
+            .await;
     }
 }
 
-async fn run_lobby(mut lobby: Lobby){
-    loop{
+async fn run_lobby(mut lobby: Lobby) {
+    loop {
         tokio::select! {
             result = lobby.handle_communication.recv() => {
                 if let Some(AddToLobby::AddNewPlayer(stream)) = result{
@@ -143,10 +139,12 @@ async fn run_lobby(mut lobby: Lobby){
                 }
             }
             result = lobby.command_reciever.recv() => {
-                println!("{:?}", result);
+                println!("wow {:?}", result);
                 if let Some(LobyPlayerAction::ChooseOpponent(id1, id2)) = result {
-                    lobby.remove_player(id1).await;
-                    lobby.remove_player(id2).await;
+                    let stream1 = lobby.remove_player(id1).await;
+                    let stream2 = lobby.remove_player(id2).await;
+                    let _ = lobby.game_organizer.send([(id1, stream1), (id2, stream2)]).await;
+                    println!("send ids");
                 }
             }
         }
@@ -159,46 +157,78 @@ struct Lobby {
     waiting_list: WaitingPlayers,
     next_player_id: PlayerId,
     /// communication between lobby and handle
-    handle_communication: mpsc::Receiver<AddToLobby>,     
+    handle_communication: mpsc::Receiver<AddToLobby>,
     /// recieves commands from lobby tasks
-    command_reciever: mpsc::Receiver<LobyPlayerAction>,   
+    command_reciever: mpsc::Receiver<LobyPlayerAction>,
     /// only used for creating new lobby tasks
-    command_sender: mpsc::Sender<LobyPlayerAction>,       
+    command_sender: mpsc::Sender<LobyPlayerAction>,
     waiting_handles: Vec<LobbyUserHandle>,
+    /// connection to GameOrganizer instance, which creates games from 2 IDs
+    game_organizer: mpsc::Sender<[(PlayerId, TcpHandle); 2]>,
 }
 
-impl Lobby{
-    fn new(handle_rx: mpsc::Receiver<AddToLobby>) -> Self{
+impl Lobby {
+    fn new(
+        handle_rx: mpsc::Receiver<AddToLobby>,
+        game_organizer: mpsc::Sender<[(PlayerId, TcpHandle); 2]>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel(32); // one for Lobby to user
-        Self { waiting_list: WaitingPlayers::new(), next_player_id: PlayerId(0), command_reciever: rx, waiting_handles: Vec::new(), command_sender: tx, handle_communication: handle_rx}
+        Self {
+            waiting_list: WaitingPlayers::new(),
+            next_player_id: PlayerId(0),
+            command_reciever: rx,
+            waiting_handles: Vec::new(),
+            command_sender: tx,
+            handle_communication: handle_rx,
+            game_organizer,
+        }
     }
 
-    async fn remove_player(&mut self, id: PlayerId) {
-        for handle in &self.waiting_handles{
-            let _ = handle.send_to_user.send(LobbyCommand::RemovePlayer(id)).await;
+    async fn remove_player(&mut self, id: PlayerId) -> TcpHandle {
+        let (tx, mut rx) = mpsc::channel(32);
+        for handle in &self.waiting_handles {
+            let _ = handle
+                .send_to_user
+                .send(LobbyCommand::RemovePlayer(id, tx.clone()))
+                .await;
         }
 
         self.waiting_list.remove(&id);
+        let stream = rx.recv().await.unwrap();
+        stream
     }
 
-    async fn add_player(&mut self, stream: TcpHandle){
+    async fn add_player(&mut self, stream: TcpHandle) {
         // get new id, send message to all waiting handles, insert new handle into waiting list
-        
-        loop{
+
+        loop {
             if !self.waiting_list.contains_key(&self.next_player_id) {
                 break;
-            } 
+            }
             self.next_player_id.add();
         }
-        let new_player = PlayerInfo{username: "".to_owned()};
+        let new_player = PlayerInfo {
+            username: "".to_owned(),
+        };
 
-        for handle in &self.waiting_handles{
-            let _ = handle.send_to_user.send(LobbyCommand::RegisterNewPlayer(self.next_player_id, new_player.clone())).await;
+        for handle in &self.waiting_handles {
+            let _ = handle
+                .send_to_user
+                .send(LobbyCommand::RegisterNewPlayer(
+                    self.next_player_id,
+                    new_player.clone(),
+                ))
+                .await;
         }
 
         self.waiting_list.insert(self.next_player_id, new_player);
 
-        let new_handle = LobbyUserHandle::new(self.command_sender.clone(), self.next_player_id, self.waiting_list.clone(), stream);
+        let new_handle = LobbyUserHandle::new(
+            self.command_sender.clone(),
+            self.next_player_id,
+            self.waiting_list.clone(),
+            stream,
+        );
         self.waiting_handles.push(new_handle);
     }
 }
@@ -213,9 +243,14 @@ struct LobbyUser {
     stream: Option<TcpHandle>,
 }
 
-
-impl LobbyUser{
-    pub fn new(id: PlayerId, players: WaitingPlayers, send_to_lobby: mpsc::Sender<LobyPlayerAction>, reciever: mpsc::Receiver<LobbyCommand>, stream: TcpHandle) -> Self{
+impl LobbyUser {
+    pub fn new(
+        id: PlayerId,
+        players: WaitingPlayers,
+        send_to_lobby: mpsc::Sender<LobyPlayerAction>,
+        reciever: mpsc::Receiver<LobbyCommand>,
+        stream: TcpHandle,
+    ) -> Self {
         Self {
             id,
             players,
@@ -228,15 +263,14 @@ impl LobbyUser{
 
 /// task, that uses LobbyUser struct to run it (its actual running method)
 /// should be spawned in a new task
-async fn active_lobby_user(mut user: LobbyUser){
+async fn active_lobby_user(mut user: LobbyUser) {
     let mut connection = user.stream.take().unwrap();
-    let mut line = String::new();
+    let mut line;
 
-    connection.write("Available players: \n".to_owned()).await;
-    for (new_id, _) in &user.players{
-        if new_id == &user.id {continue;}
-        connection.send_to_stream.send(TcpRequest::Write(format!("{}\n", new_id.0).to_owned())).await;
-    }
+    let _ = connection
+            .write(serde_json::to_string(&user.players).unwrap())
+            .await;
+    println!("sent");
     loop {
         tokio::select! {
             result = connection.read() => {
@@ -251,11 +285,10 @@ async fn active_lobby_user(mut user: LobbyUser){
                         continue;
                     }
                 });
-    
+
                 if user.players.contains_key(&id) && id != user.id{
                     let _ = user.send_to_lobby.send(LobyPlayerAction::ChooseOpponent(user.id, id)).await;
                     connection.write(format!("Found match {}", id.0).to_owned()).await;
-                    break;
                 }
                 else {
                     connection.write("Wrong number".to_owned()).await;
@@ -265,38 +298,42 @@ async fn active_lobby_user(mut user: LobbyUser){
             result = user.reciever.recv() => {
                     match result.unwrap() {
                         LobbyCommand::RegisterNewPlayer(id, info) => user.players.insert(id, info),
-                        LobbyCommand::RemovePlayer(id) => {
-                            if user.id == id {break}
+                        LobbyCommand::RemovePlayer(id, tx) => {
+                            if user.id == id {
+                                println!("sent :)");
+                                tx.send(connection).await.unwrap();
+                                break;
+                            }
+                            println!("no sent");
                             user.players.remove(&id)
-                        }, 
+                        },
                     };
-                    connection.write("Available players: \n".to_owned()).await;
-                    for (new_id, _) in &user.players{
-                        if new_id == &user.id {continue;}
-                        connection.write(format!("{}\n", new_id.0).to_owned()).await;
-                    }
+                    let _ = connection
+                        .write(serde_json::to_string(&user.players).unwrap())
+                        .await;
             }
         }
-        
     }
     println!("Client {} Disconnected", user.id.0);
 }
 
-struct LobbyUserHandle{
+struct LobbyUserHandle {
     send_to_user: mpsc::Sender<LobbyCommand>,
 }
 
-impl LobbyUserHandle{
-    pub fn new(send_to_lobby: mpsc::Sender<LobyPlayerAction>, id: PlayerId, players: WaitingPlayers, stream: TcpHandle) -> Self{
-        let (tx, rx) = mpsc::channel(32); 
+impl LobbyUserHandle {
+    pub fn new(
+        send_to_lobby: mpsc::Sender<LobyPlayerAction>,
+        id: PlayerId,
+        players: WaitingPlayers,
+        stream: TcpHandle,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel(32);
 
-  
         let user = LobbyUser::new(id, players, send_to_lobby, rx, stream);
 
         tokio::spawn(active_lobby_user(user));
 
-        Self{
-            send_to_user: tx,
-        }
+        Self { send_to_user: tx }
     }
 }

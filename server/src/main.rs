@@ -8,14 +8,19 @@ use tokio::{
 mod lobby;
 use lobby::{LobbyHandle, TcpHandle};
 
+mod game_organizer;
+use game_organizer::GameOrganizerHandle;
+
 #[tokio::main]
 async fn main() {
     println!("Hello world!");
 
     let listener = TcpListener::bind("127.0.0.1:8080").await.unwrap();
-    let mut lobby = LobbyHandle::new();
+    let (tx, rx) = mpsc::channel(32);
+    GameOrganizerHandle::run(rx);
+    let mut lobby = LobbyHandle::new(tx);
 
-    loop{
+    loop {
         let (stream, _addr) = listener.accept().await.unwrap();
         let handle = TcpHandle::new(stream);
         lobby.add_player(handle).await;

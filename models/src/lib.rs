@@ -1,5 +1,8 @@
 pub mod logic;
-use std::collections::{HashSet, HashMap};
+pub mod lobby_message;
+use serde::*;
+use std::collections::{HashMap, HashSet};
+
 #[allow(dead_code)]
 #[derive(Hash, Debug, PartialEq, Eq, Clone, Copy)]
 pub enum PieceType {
@@ -28,6 +31,23 @@ pub struct Board {
     pub count: usize,
 }
 
+#[derive(
+    std::cmp::Eq, std::cmp::PartialEq, std::hash::Hash, Clone, Copy, Debug, Serialize, Deserialize,
+)]
+pub struct PlayerId(pub u32);
+impl PlayerId {
+    pub fn add(&mut self) {
+        self.0 += 1;
+    }
+}
+
+pub type IdPair = [PlayerId; 2];
+pub type WaitingPlayers = HashMap<PlayerId, PlayerInfo>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlayerInfo {
+    pub username: String,
+}
 
 impl Board {
     pub fn new() -> Board {
@@ -211,8 +231,6 @@ impl Board {
     }
 }
 
-
-
 impl Iterator for Board {
     type Item = Option<Piece>;
 
@@ -239,13 +257,12 @@ pub struct Piece {
     pub player: Player,
 }
 
-
 impl Board {
-    fn get(&self, x: i32, y: i32) -> Option<Piece>{
+    fn get(&self, x: i32, y: i32) -> Option<Piece> {
         self.raw[y as usize][x as usize]
     }
 
-    pub fn move_piece(&mut self, old_pos: Position, new_pos: Position){
+    pub fn move_piece(&mut self, old_pos: Position, new_pos: Position) {
         let p = self.raw[old_pos.y as usize][old_pos.x as usize];
         if let Some(mut p) = p {
             p.pos = new_pos;

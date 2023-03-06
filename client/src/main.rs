@@ -4,14 +4,23 @@ use std::{
     net::TcpStream,
 };
 
+mod lobby_selection;
+use lobby_selection::get_opponent;
+
+use serde::{Deserialize, Serialize};
+
 pub mod gui;
 use macroquad::prelude::*;
-use models::Player;
-pub use models::{logic, Board, PieceType, Position};
-use std::collections::HashSet;
+use models::{Player, PlayerInfo, PlayerId};
+pub use models::{logic, Board, PieceType, Position, WaitingPlayers};
+use std::collections::{HashSet, HashMap};
 
 #[macroquad::main("Chess")]
 async fn main() {
+    let mut connection = TcpStream::connect("127.0.0.1:8080").unwrap();
+
+   get_opponent(&mut connection).await;
+
     let piece_textures = gui::create_textures().await;
     let mut g = logic::Game {
         board: Board::new(),
@@ -19,11 +28,11 @@ async fn main() {
         current_player: Player::White,
         in_check: None,
     };
-    let mut storage = EventStorage{
+    let mut storage = EventStorage {
         event_type: Event::Waiting,
-        old_pos: Position{x: 9, y: 9},
+        old_pos: Position { x: 9, y: 9 },
         moves: None,
-        new_pos: Position{x: 9, y: 9},
+        new_pos: Position { x: 9, y: 9 },
     };
 
     loop {
@@ -37,21 +46,20 @@ async fn main() {
             // println!("{:?}", storage);
             match storage.event_type {
                 Event::Waiting => {
-                    if pos != storage.new_pos{
+                    if pos != storage.new_pos {
                         storage.event_type = Event::StoringLocation;
                         storage.moves = Some(g.get_moves(pos));
                         storage.old_pos = pos;
                     }
                 }
                 Event::StoringLocation => {
-                    if let Some(moves) = &storage.moves{
+                    if let Some(moves) = &storage.moves {
                         if moves.contains(&pos) {
                             g.move_piece(storage.old_pos, pos);
                             storage.new_pos = pos;
                             storage.moves = None;
                             storage.event_type = Event::Waiting;
-                        }
-                        else{
+                        } else {
                             storage.moves = Some(g.get_moves(pos));
                             storage.old_pos = pos;
                         }
@@ -59,7 +67,7 @@ async fn main() {
                 }
             }
         }
-        if let Some(m) = &storage.moves{
+        if let Some(m) = &storage.moves {
             gui::draw_moves(storage.old_pos, m);
         }
         for piece in &mut g.board {
@@ -72,9 +80,9 @@ async fn main() {
 }
 
 #[derive(Debug)]
-struct EventStorage{
+struct EventStorage {
     event_type: Event,
-    old_pos:Position,
+    old_pos: Position,
     moves: Option<HashSet<Position>>,
     new_pos: Position,
 }
